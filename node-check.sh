@@ -47,6 +47,7 @@ echo "Virt:     $(systemd-detect-virt 2>/dev/null || echo '?')"
 echo "CPU:      $(nproc) x $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs)"
 echo "Uptime:   $(uptime -p 2>/dev/null)"
 echo "Load:     $(cut -d' ' -f1-3 /proc/loadavg)"
+echo "NTP sync: $(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo '?')  (yes = часы синхронизированы)"
 
 sec "ПАМЯТЬ И ДИСК"
 free -h
@@ -72,6 +73,8 @@ echo "default_qdisc:      $QD"
 echo "available:          $AVAIL"
 IFACE=$(ip -o route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
 echo "Внешний интерфейс:  ${IFACE:-?}"
+IQD=""
+[ -n "${IFACE:-}" ] && IQD=$(tc qdisc show dev "$IFACE" 2>/dev/null | awk 'NR==1{print $2}')
 [ -n "${IFACE:-}" ] && echo "qdisc на $IFACE:     $(tc qdisc show dev "$IFACE" 2>/dev/null | head -1)"
 [ -n "${IFACE:-}" ] && echo "MTU $IFACE:          $(cat /sys/class/net/"$IFACE"/mtu 2>/dev/null)"
 
@@ -85,7 +88,9 @@ for k in net.core.rmem_max net.core.wmem_max net.ipv4.tcp_rmem net.ipv4.tcp_wmem
 done
 echo
 echo "conntrack в dmesg:"
-dmesg 2>/dev/null | grep -i 'conntrack.*full' | tail -3 || true
+{ dmesg 2>/dev/null; journalctl -k --since "7 days ago" --no-pager 2>/dev/null; } | grep -i 'conntrack.*full' | tail -3 || true
+CT_MAX=$(sc net.netfilter.nf_conntrack_max)
+case "$CT_MAX" in ''|*[!0-9]*) ;; *) [ "$CT_MAX" -lt 65536 ] && echo "ВНИМАНИЕ: nf_conntrack_max=$CT_MAX слишком мал, при пиках пакеты будут дропаться";; esac
 echo "(пусто = таблица не переполнялась)"
 
 sec "СОЕДИНЕНИЯ"
@@ -120,13 +125,16 @@ if [ "$NO_SPEED" -eq 0 ]; then
   sec "СПИДТЕСТ"
   if have python3; then
     curl -fsSL --max-time 20 https://raw.githubusercontent.com/sivel/speedtest-cli/master/speedtest.py \
-      | python3 - --simple --secure 2>&1 || echo "Спидтест не удался"
+      | python3 -W ignore - --simple --secure 2>&1 || echo "Спидтест не удался"
   else
     echo "python3 не найден, пропуск"
   fi
 fi
 
 # ---------------------------------------------------------------- тюнинг
+# не уменьшаем значения, которые уже выше наших
+keepmax() { local cur; cur=$(sc "$1" | awk '{print $NF}'); case "$cur" in ''|*[!0-9]*) echo "$2";; *) [ "$cur" -gt "$2" ] && echo "$cur" || echo "$2";; esac; }
+
 apply_tuning() {
   sec "ПРИМЕНЯЮ ТЮНИНГ"
   modprobe tcp_bbr 2>/dev/null || true
@@ -142,6 +150,12 @@ apply_tuning() {
   MEM_MB=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
   CT=$(( MEM_MB * 64 )); [ "$CT" -lt 65536 ] && CT=65536; [ "$CT" -gt 1048576 ] && CT=1048576
 
+  RMAX=$(keepmax net.core.rmem_max 16777216); WMAX=$(keepmax net.core.wmem_max 16777216)
+  TRMAX=$(keepmax net.ipv4.tcp_rmem 16777216); TWMAX=$(keepmax net.ipv4.tcp_wmem 16777216)
+  SOMAX=$(keepmax net.core.somaxconn 8192); NDB=$(keepmax net.core.netdev_max_backlog 16384)
+  SYNB=$(keepmax net.ipv4.tcp_max_syn_backlog 8192); FMAX=$(keepmax fs.file-max 1048576)
+  CT=$(keepmax net.netfilter.nf_conntrack_max "$CT")
+
   [ -f "$TUNE_FILE" ] && cp "$TUNE_FILE" "$TUNE_FILE.bak.$(date +%s)"
   cat > "$TUNE_FILE" <<EOF
 # node-check.sh: тюнинг под Xray ($(date -u '+%Y-%m-%d'))
@@ -149,19 +163,19 @@ net.core.default_qdisc = fq
 $BBR_LINE
 
 # буферы: до 16 МБ на сокет, хватает для гигабита на длинных маршрутах
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
+net.core.rmem_max = $RMAX
+net.core.wmem_max = $WMAX
 net.core.rmem_default = 262144
 net.core.wmem_default = 262144
-net.ipv4.tcp_rmem = 4096 87380 16777216
-net.ipv4.tcp_wmem = 4096 65536 16777216
+net.ipv4.tcp_rmem = 4096 87380 $TRMAX
+net.ipv4.tcp_wmem = 4096 65536 $TWMAX
 net.ipv4.udp_rmem_min = 16384
 net.ipv4.udp_wmem_min = 16384
 
 # очереди под пики соединений
-net.core.somaxconn = 8192
-net.core.netdev_max_backlog = 16384
-net.ipv4.tcp_max_syn_backlog = 8192
+net.core.somaxconn = $SOMAX
+net.core.netdev_max_backlog = $NDB
+net.ipv4.tcp_max_syn_backlog = $SYNB
 
 # стабильность на плохих маршрутах (РФ, мобильные сети)
 net.ipv4.tcp_mtu_probing = 1
@@ -178,10 +192,12 @@ net.ipv4.tcp_tw_reuse = 1
 net.ipv4.ip_local_port_range = 10240 65535
 
 # лимиты
-fs.file-max = 1048576
+fs.file-max = $FMAX
 net.netfilter.nf_conntrack_max = $CT
 EOF
   # conntrack-ключ существует только при загруженном модуле
+  # без модуля при загрузке sysctl не применит conntrack-ключ
+  [ -e /proc/sys/net/netfilter/nf_conntrack_max ] && echo nf_conntrack > /etc/modules-load.d/nf_conntrack.conf
   if [ ! -e /proc/sys/net/netfilter/nf_conntrack_max ]; then
     sed -i 's/^net.netfilter.nf_conntrack_max/# &/' "$TUNE_FILE"
   fi
@@ -204,11 +220,12 @@ EOF
 sec "ИТОГ"
 if [ "$DRY_RUN" -eq 1 ]; then
   echo "--dry-run: ничего не меняю. BBR=$CC, qdisc=$QD"
-elif [ "$FORCE_FIX" -eq 1 ] || [ "$CC" != "bbr" ] || [ "$QD" != "fq" ]; then
-  [ "$FORCE_FIX" -eq 0 ] && echo "BBR/fq не включены (cc=$CC, qdisc=$QD) — включаю."
+elif [ "$FORCE_FIX" -eq 1 ] || [ "$CC" != "bbr" ] || [ "$QD" != "fq" ] || { [ -n "$IQD" ] && [ "$IQD" != "fq" ]; } \
+     || { case "${CT_MAX:-x}" in *[!0-9]*) false;; *) [ "$CT_MAX" -lt 65536 ];; esac; }; then
+  [ "$FORCE_FIX" -eq 0 ] && echo "Нужен тюнинг (cc=$CC, default_qdisc=$QD, qdisc интерфейса=${IQD:-?}, conntrack_max=${CT_MAX:-?}) — применяю."
   apply_tuning
 else
-  echo "BBR и fq уже включены, тюнинг не нужен. Принудительно: --fix"
+  echo "BBR и fq включены (в том числе на интерфейсе), conntrack в норме. Принудительно: --fix"
 fi
 
 echo
