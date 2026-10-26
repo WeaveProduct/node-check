@@ -17,7 +17,11 @@ for a in "$@"; do
     --fix) FORCE_FIX=1 ;;
     --no-speed) NO_SPEED=1 ;;
     --dry-run) DRY_RUN=1 ;;
-    -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
+    -h|--help) printf '%s\n' "node-check.sh [--dry-run] [--fix] [--no-speed]" \
+      "  без флагов   отчёт; если BBR/fq не включены, включает и тюнит" \
+      "  --dry-run    только отчёт, ничего не менять" \
+      "  --fix        применить тюнинг принудительно" \
+      "  --no-speed   без спидтеста"; exit 0 ;;
     *) echo "Неизвестный аргумент: $a"; exit 1 ;;
   esac
 done
